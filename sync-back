@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+#
+# Perform a full backup to a mounted media drive of type /media/*/backup
+#
+import argparse
+import ConfigParser
+import datetime
+import json
+import os
+import shutil
+
+from subprocess import Popen, PIPE, STDOUT
+
+parser = argparse.ArgumentParser(description="backup")
+parser.add_argument('-c', '--config', dest='config', default=os.path.expanduser('~/.sync-back.config'))
+parser.add_argument('-s', '--section', dest='section', default=None)
+parser.add_argument('-f', '--full', dest='full', action='store_true')
+parser.add_argument('-v', '--verbose', dest='verbose', action='store_true')
+parser.add_argument('-q', '--quiet', dest='quiet', action='store_true')
+args = parser.parse_args()
+
+if not os.path.exists(args.config):
+    report("ERROR: Config file %s does not exist" % args.config)
+    exit(1)
+
+config = ConfigParser.ConfigParser()
+config.read([args.config])
+
+def perform_backup(section, time):
+    if not config.has_option(section, 'source'):
+        report("ERROR: Cannot perform '%s' backup because it does not have a source directory configured" % section)
+        return
+
+    if not os.path.exists(config.get(section, 'source')):
+        report("ERROR: Cannot perform '%s' backup because the source directory %s does not exist" % (section, config.get('default', 'source')))
+        return
+
+    if not config.has_option(section, 'target'):
+        report("ERROR: Cannot perform '%s' backup because it does not have a target directory configured" % section)
+        return
+
+    if not config.has_option(section, 'rsync_options'):
+        report("ERROR: Cannot perform '%s' backup because it does not have any rsync options configured" % section)
+        return
+
+    rsync_options = config.get(section, 'rsync_options').split()
+
+    if config.has_option(section, 'exclusion_file'):
+        exclusion_file = config.get(section, 'exclusion_file')
+        if not os.path.exists(exclusion_file):
+            report("ERROR: Cannot perform '%s' backup because exclusion file %s does not exist" % (section, exclusion_file))
+        if not os.path.isfile(exclusion_file):
+            report("ERROR: Cannot perform '%s' backup because exclusion file %s is not a file" % (section, exclusion_file))
+        rsync_options += ['--exclude-from=%s' % os.path.realpath(exclusion_file)]
+
+    if args.verbose:
+        rsync_options += ['-v']
+
+    if args.quiet:
+        rsync_options += ['-q']
+
+    execute_pre_backup(section)
+
+    if not os.path.exists(config.get(section, 'target')):
+        os.makedirs(config.get(section, 'target'))
+
+    entries = os.listdir(config.get(section, 'target'))
+
+    backup_dir = create_backup_dir_name(time, config.get(section, 'frequency'))
+    real_backup_dir = backup_dir
+
+    if not entries or args.full:
+        real_backup_dir += '-FULL'
+    else:
+        link_dest = get_link_dest(entries, time, config.get(section, 'frequency'))
+        if link_dest:
+            rsync_options += ['--link-dest=%s' % os.path.realpath(os.path.join(config.get(section, 'target'), link_dest))]
+        else:
+            real_backup_dir += 'FULL'
+
+    source_dir = config.get(section, 'source')
+    real_source_dir = os.path.realpath(source_dir)
+    if not real_source_dir.endswith('/'):
+        real_source_dir += '/'
+    target_dir = os.path.join(config.get(section, 'target'), real_backup_dir)
+    real_target_dir = os.path.realpath(target_dir)
+    if not real_target_dir.endswith('/'):
+        real_target_dir += '/'
+
+    if os.path.exists(os.path.join(config.get(section, 'target'), backup_dir)):
+        report("ERROR: Cannot perform '%s' backup because target directory %s already exists" % (section, target_dir))
+        execute_post_backup(section)
+        return
+
+    if os.path.exists(os.path.join(config.get(section, 'target'), backup_dir) + '-FULL'):
+        report("ERROR: Cannot perform '%s' backup because target directory %s-FULL already exists" % (section, target_dir))
+        execute_post_backup(section)
+        return
+
+    os.makedirs(target_dir)
+
+    rsync_options.append(real_source_dir)
+    rsync_options.append(real_target_dir)
+
+    process_args = []
+
+    if config.has_option(section, 'sudo_rsync') and config.getboolean(section, 'sudo_rsync'):
+        process_args += ['sudo']
+
+    process_args += ['rsync'] + rsync_options
+
+    returncode = execute_command(process_args)
+
+    if returncode == 0:
+        entries = os.listdir(config.get(section, 'target'))
+        compress_entries(entries, config.get(section, 'target'), config.get(section, 'frequency'))
+        report("SUCCESS: '%s' backup completed successfully from %s to %s" % (section, source_dir, target_dir))
+    else:
+        report("ERROR: '%s' backup failed with exit code %d" % (section, returncode))
+
+    execute_post_backup(section)
+
+def execute_pre_backup(section):
+    if config.has_option(section, 'pre_backup'):
+        commands = json.loads(config.get(section, 'pre_backup'))
+        for command in commands:
+            execute_command(command.split())
+
+def execute_post_backup(section):
+    if config.has_option(section, 'post_backup'):
+        commands = json.loads(config.get(section, 'post_backup'))
+        for command in commands:
+            execute_command(command.split())
+
+def execute_command(command_args):
+    print command_args
+    process = Popen(command_args, stdout=PIPE, stderr=STDOUT)
+    while True:
+        line = process.stdout.readline()
+        if line != '':
+            print line.rstrip()
+        else:
+            break;
+    process.wait()
+    return process.returncode
+
+def compress_entries(entries, target, frequency):
+    entries.sort()
+    latest_entry = entries[-1]
+    entry_time = get_datetime_from_entry(latest_entry, frequency)
+    earlier_time = month_before(entry_time)
+    if earlier_time:
+        possibly_remove_backup(target, earlier_time, frequency)
+        earlier_time = month_before(datetime.datetime(earlier_time.year, earlier_time.month, 1))
+        earlier_month = earlier_time.month
+        for day in range(31):
+            earlier_time = earlier_time + datetime.timedelta(days = 1)
+            if earlier_time.month == earlier_month:
+                possibly_remove_backup(target, earlier_time, frequency)
+
+def possibly_remove_backup(target, time, frequency):
+    if time.day != 1:
+        backup_dir = os.path.join(target, create_backup_dir_name(time, frequency))
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+
+def month_before(time):
+    earlier = datetime.datetime(time.year, time.month, 1) - datetime.timedelta(days = 1)
+    try:
+        return datetime.datetime(earlier.year, earlier.month, time.day)
+    except ValueError:
+        return None
+
+def get_link_dest(entries, time, frequency):
+    link_dests = sorted([entry for entry in entries if potential_link_dest(entry, frequency)])
+    return link_dests[-1]
+
+def potential_link_dest(entry, frequency):
+    if entry.endswith('-FULL'):
+        return True
+    if get_datetime_from_entry(entry, frequency).day == 1:
+        return True
+    return False
+
+def get_datetime_from_entry(entry, frequency):
+    if entry.endswith('-FULL'):
+        entry = entry[:-5]
+    if frequency == 'day':
+        return datetime.datetime.strptime(entry, '%Y-%m-%d')
+
+def create_backup_dir_name(time, frequency):
+    if frequency == 'day':
+        return time.strftime('%Y-%m-%d')
+    elif frequency == 'hour':
+        return time.strftime('%Y-%m-%d-%H')
+    return time.strftime('%Y-%m-%d-%H-%M')
+
+def report(message):
+    if not args.quiet:
+        print message
+
+starttime = datetime.datetime.now()
+
+if args.section:
+    perform_backup(args.section, starttime)
+else:
+    for section in config.sections():
+        perform_backup(section, starttime)
